@@ -25,9 +25,12 @@ import time
 import threading
 import requests as http_requests
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 from flask import Flask, Response
+
+SYDNEY_TZ = ZoneInfo("Australia/Sydney")
 
 load_dotenv()
 
@@ -443,7 +446,7 @@ def organise_by_repo(issues, ticket_repos):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_dashboard() -> str:
-    now_str = datetime.now().strftime("%d %B %Y, %H:%M AEST").lstrip("0")
+    now_str = datetime.now(SYDNEY_TZ).strftime("%-d %B %Y, %H:%M %Z")
 
     print(f"[{now_str}] Building dashboard...")
     release_issues = get_release_tickets()
