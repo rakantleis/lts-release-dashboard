@@ -184,20 +184,29 @@ def get_blocker_tickets():
         ISSUE_FIELDS,
     )
 
-def get_repos_for_issue(issue_id: str) -> list:
+# Branch names that indicate code has been deployed to production
+PROD_BRANCHES = {"main", "master", "release", "production", "prod"}
+
+def get_repos_for_issue(issue_id: str) -> dict:
+    """Return {"slugs": [...], "deployed": bool}.
+    deployed=True means at least one PR for this issue was merged into a
+    production branch (main/master/release/prod), indicating the code is live
+    even if the Jira status hasn't been updated yet.
+    """
     url    = f"{JIRA_BASE_URL}/rest/dev-status/1.0/issue/detail"
     params = {"issueId": issue_id, "applicationType": "bitbucket", "dataType": "repository"}
     try:
         r = http_requests.get(url, headers=_auth_header(), params=params, timeout=10)
         if r.status_code in (403, 404):
-            return []
+            return {"slugs": [], "deployed": False}
         r.raise_for_status()
         data = r.json()
     except Exception as e:
         print(f"  ⚠  Dev status failed for {issue_id}: {e}")
-        return []
+        return {"slugs": [], "deployed": False}
 
-    slugs = []
+    slugs    = []
+    deployed = False
     for detail in data.get("detail", []):
         for repo in detail.get("repositories", []):
             slug = (repo.get("slug") or repo.get("name", "")).lower().strip()
@@ -205,9 +214,20 @@ def get_repos_for_issue(issue_id: str) -> list:
                 slug = slug.split("/")[-1]
             if slug and slug not in IGNORE_REPOS and slug not in slugs:
                 slugs.append(slug)
-    return slugs
+            # Check pull requests for a merge into a production branch
+            for pr in repo.get("pullRequests", []):
+                dest = (pr.get("destination") or {})
+                dest_branch = (dest.get("branch") or "").lower().strip()
+                # normalise: "refs/heads/main" → "main"
+                if "/" in dest_branch:
+                    dest_branch = dest_branch.split("/")[-1]
+                if pr.get("status", "").upper() == "MERGED" and dest_branch in PROD_BRANCHES:
+                    deployed = True
+
+    return {"slugs": slugs, "deployed": deployed}
 
 def fetch_all_repos(issues: list) -> dict:
+    """Returns {issue_key: {"slugs": [...], "deployed": bool}}"""
     result = {}
     with ThreadPoolExecutor(max_workers=8) as pool:
         futures = {pool.submit(get_repos_for_issue, i["id"]): i["key"] for i in issues}
@@ -269,7 +289,9 @@ def ticket_card_html(issue: dict, show_status: bool = False) -> str:
     sname    = fields.get("status", {}).get("name", "")
     days     = days_ago(fields.get("created", ""))
 
+    deployed    = issue.get("_deployed", False)
     extra_badge = status_badge(sname) if show_status else f'<span class="badge badge-type">{itype}</span>'
+    deploy_badge = '<span class="badge badge-deployed">✅ Deployed to live</span>' if deployed else ""
 
     return f"""
         <div class="ticket" onclick="window.open('{url}','_blank')">
@@ -286,7 +308,10 @@ def ticket_card_html(issue: dict, show_status: bool = False) -> str:
               <div class="avatar" style="background:{acolor};">{initials(aname)}</div>
               {aname}
             </div>
-            {age_badge(days)}
+            <div style="display:flex;gap:4px;align-items:center;">
+              {deploy_badge}
+              {age_badge(days)}
+            </div>
           </div>
         </div>"""
 
@@ -375,6 +400,7 @@ body{font-family:'Open Sans',sans-serif;background:var(--bg);color:var(--text);f
 .badge-age.old{background:#FFECEC;color:var(--danger);}
 .badge-type{background:#EFF3F8;color:var(--navy-mid);}
 .badge-status{background:#F0F4F8;color:var(--grey);}
+.badge-deployed{background:#E6F9E6;color:#1A7A1A;border:1px solid #B2DFB2;}
 .blocker-col .repo-header{background:var(--danger)!important;}
 .blocker-col{border-color:#e8c5c5;}
 .info-banner{background:#EFF7FF;border:1px solid var(--light-blue);border-left:4px solid var(--blue);
@@ -424,8 +450,11 @@ def organise_by_repo(issues, ticket_repos):
     undetected    = []
     unknown_slugs = []
     for issue in issues:
-        key   = issue["key"]
-        slugs = ticket_repos.get(key, [])
+        key      = issue["key"]
+        dev_data = ticket_repos.get(key, {"slugs": [], "deployed": False})
+        slugs    = dev_data["slugs"]
+        # Attach deployed flag directly to the issue dict for use in card rendering
+        issue["_deployed"] = dev_data["deployed"]
         known   = [s for s in slugs if s in REPO_MAP]
         unknown = [s for s in slugs if s not in REPO_MAP and s not in IGNORE_REPOS]
         for u in unknown:
