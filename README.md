@@ -50,6 +50,7 @@ python app.py
 | `JIRA_API_TOKEN` | Jira API token — generate at [id.atlassian.com/manage-profile/security/api-tokens](https://id.atlassian.com/manage-profile/security/api-tokens) |
 | `CACHE_TTL_SECONDS` | Optional. How often the dashboard refreshes data. Default: `900` (15 min) |
 | `RELEASE_ALARM` | Optional. Ticket count that triggers the per-repo alarm. Default: `5` |
+| `SLACK_WEBHOOK_URL` | Optional. Incoming Webhook URL to post alarms to Slack. Get one at api.slack.com/apps |
 
 ## Deployment
 
