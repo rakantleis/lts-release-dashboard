@@ -106,62 +106,45 @@ p{font-size:13px;color:#666;line-height:1.5;margin-bottom:24px;}
 </body>
 </html>"""
 
-# Tracks alarm state per repo.
-# None = first build not yet done (baseline not established).
-# On first build we record the state silently — no Slack fired.
-# Slack only fires on a genuine False→True transition in a live session.
-_alarm_state: dict = {}   # slug -> bool  (or absent if not yet seen)
+CRON_SECRET = os.getenv("CRON_SECRET", "")   # optional token to protect /cron/daily-report
 
 
-def send_slack_alarm(repo_label: str, icon: str, count: int, top_tickets: list):
-    """POST a message to Slack when a repo trips the alarm threshold."""
+def send_daily_report(rel_cols: dict):
+    """Send a Slack summary of any repos currently over the release alarm threshold."""
     if not SLACK_WEBHOOK_URL:
         return
-    shown        = top_tickets[:5]
-    remaining    = count - len(shown)
-    ticket_lines = "\n".join(f"• <{JIRA_BASE_URL}/browse/{t}|{t}>" for t in shown)
-    if remaining > 0:
-        ticket_lines += f"\n_…and {remaining} more_"
+
+    alarm_blocks = []
+    for slug, cfg in REPO_MAP.items():
+        tickets = rel_cols.get(slug, [])
+        count   = len(tickets)
+        if count >= RELEASE_ALARM:
+            shown        = tickets[:5]
+            remaining    = count - len(shown)
+            ticket_lines = "\n".join(
+                f"• <{JIRA_BASE_URL}/browse/{t['key']}|{t['key']}>" for t in shown
+            )
+            if remaining > 0:
+                ticket_lines += f"\n_…and {remaining} more_"
+            alarm_blocks.append(
+                f":rotating_light: *{cfg['icon']} {cfg['label']}* — "
+                f"*{count} ticket{'s' if count != 1 else ''}* waiting for live release\n"
+                f"{ticket_lines}"
+            )
+
+    if not alarm_blocks:
+        print("  ✅ Daily report: no repos over threshold — nothing sent to Slack.")
+        return
+
+    body = "\n\n".join(alarm_blocks)
     payload = {
-        "text": (
-            f":rotating_light: *LTS Release Dashboard — {icon} {repo_label}* has "
-            f"*{count} ticket{'s' if count != 1 else ''}* waiting for live release.\n"
-            f"{ticket_lines}"
-        )
+        "text": f":calendar: *LTS Daily Release Report*\n\n{body}"
     }
     try:
         http_requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+        print(f"  📣 Daily report sent to Slack ({len(alarm_blocks)} repo(s) over threshold).")
     except Exception as e:
-        print(f"  ⚠  Slack notification failed: {e}")
-
-
-def check_and_fire_alarms(rel_cols: dict):
-    """Fire Slack only on a genuine non-alarming → alarming transition.
-
-    On the very first build after a server start we silently record the
-    baseline state without firing — this prevents spurious notifications
-    every time Render's free tier wakes the instance back up.
-    """
-    global _alarm_state
-    for slug, cfg in REPO_MAP.items():
-        count       = len(rel_cols.get(slug, []))
-        is_alarming = count >= RELEASE_ALARM
-
-        if slug not in _alarm_state:
-            # First build — establish baseline silently, never fire here
-            print(f"  📋 Baseline for {cfg['label']}: {count} tickets "
-                  f"({'alarming' if is_alarming else 'ok'})")
-            _alarm_state[slug] = is_alarming
-            continue
-
-        was_alarming = _alarm_state[slug]
-        if is_alarming and not was_alarming:
-            # Genuine new alarm during this session — notify
-            top_keys = [t["key"] for t in rel_cols[slug][:5]]
-            print(f"  🚨 Alarm fired for {cfg['label']} ({count} tickets) — notifying Slack")
-            send_slack_alarm(cfg["label"], cfg["icon"], count, top_keys)
-
-        _alarm_state[slug] = is_alarming
+        print(f"  ⚠  Slack daily report failed: {e}")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH
@@ -471,8 +454,6 @@ def build_dashboard() -> str:
     rel_cols, rel_undetected, rel_unknown = organise_by_repo(release_issues, ticket_repos)
     blk_cols, _,              blk_unknown = organise_by_repo(blocker_issues, ticket_repos)
 
-    check_and_fire_alarms(rel_cols)
-
     # KPI strip
     kpi_html = ""
     for slug, cfg in REPO_MAP.items():
@@ -592,6 +573,39 @@ def build_dashboard() -> str:
 
 @app.route("/health")
 def health():
+    return "OK", 200
+
+
+@app.route("/cron/daily-report")
+def cron_daily_report():
+    """Called by an external cron service (e.g. cron-job.org) every day at 10 am AEST.
+    Sends a Slack message for any repo with >= RELEASE_ALARM tickets.
+    Optionally protected by ?secret=<CRON_SECRET> query param.
+    """
+    from flask import request as flask_request
+    if CRON_SECRET and flask_request.args.get("secret") != CRON_SECRET:
+        return "Forbidden", 403
+
+    # Use cached data if fresh, otherwise build now (blocks — cron callers can wait)
+    with _cache["lock"]:
+        age   = time.time() - _cache["timestamp"]
+        stale = _cache["html"] is None or age > CACHE_TTL
+
+    if stale:
+        print("[cron] Cache stale — building fresh data for daily report...")
+        html = build_dashboard()
+        with _cache["lock"]:
+            _cache["html"]      = html
+            _cache["timestamp"] = time.time()
+
+    # Re-run organise step to get rel_cols from the latest Jira data
+    print("[cron] Running daily report check...")
+    release_issues = get_release_tickets()
+    blocker_issues = get_blocker_tickets()
+    all_issues     = release_issues + blocker_issues
+    ticket_repos   = fetch_all_repos(all_issues)
+    rel_cols, _, _ = organise_by_repo(release_issues, ticket_repos)
+    send_daily_report(rel_cols)
     return "OK", 200
 
 def _background_build():
