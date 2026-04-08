@@ -66,8 +66,45 @@ _cache = {
     "html":      None,
     "timestamp": 0,
     "lock":      threading.Lock(),
-    "building":  False,
+    "building":  False,   # True while a background build is running
 }
+
+LOADING_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<meta http-equiv="refresh" content="4">
+<title>LTS Release Dashboard — Loading…</title>
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+:root{--navy:#1E365E;--orange:#F69139;--light-blue:#9DC0E4;--white:#FFFFFF;--bg:#EEEEEE;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Open Sans',sans-serif;background:var(--bg);display:flex;flex-direction:column;
+  align-items:center;justify-content:center;min-height:100vh;color:var(--navy);}
+.card{background:var(--white);border-radius:12px;padding:48px 56px;text-align:center;
+  box-shadow:0 4px 24px rgba(0,0,0,.12);max-width:420px;width:90%;}
+.logo{width:52px;height:52px;background:var(--orange);border-radius:10px;display:flex;
+  align-items:center;justify-content:center;font-weight:700;color:var(--white);font-size:18px;
+  margin:0 auto 20px;}
+h1{font-size:20px;font-weight:700;color:var(--navy);margin-bottom:8px;}
+p{font-size:13px;color:#666;line-height:1.5;margin-bottom:24px;}
+.spinner{width:36px;height:36px;border:3px solid #e0e0e0;border-top-color:var(--orange);
+  border-radius:50%;animation:spin 0.8s linear infinite;margin:0 auto;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.note{font-size:11px;color:#aaa;margin-top:20px;}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">LTS</div>
+    <h1>Building dashboard…</h1>
+    <p>Fetching tickets from Jira and checking Bitbucket commit data.<br>This takes about 30–60 seconds on first load.</p>
+    <div class="spinner"></div>
+    <div class="note">This page refreshes automatically every 4 seconds.</div>
+  </div>
+</body>
+</html>"""
 
 # Tracks which repos are currently in alarm state so we only fire Slack once
 # per transition (not on every refresh while alarm is active).
@@ -536,32 +573,59 @@ def build_dashboard() -> str:
 def health():
     return "OK", 200
 
+def _background_build():
+    """Run build_dashboard() in a background thread; store result in cache."""
+    try:
+        html = build_dashboard()
+        with _cache["lock"]:
+            _cache["html"]      = html
+            _cache["timestamp"] = time.time()
+            _cache["building"]  = False
+        print("  ✅ Background build complete.")
+    except Exception as e:
+        print(f"  ❌ Background build failed: {e}")
+        with _cache["lock"]:
+            _cache["building"] = False
+
+
+def _trigger_build_if_needed():
+    """Start a background build if cache is stale and no build is running."""
+    with _cache["lock"]:
+        age   = time.time() - _cache["timestamp"]
+        stale = _cache["html"] is None or age > CACHE_TTL
+        if stale and not _cache["building"]:
+            _cache["building"] = True
+            t = threading.Thread(target=_background_build, daemon=True)
+            t.start()
+            return True   # build just kicked off
+    return False
+
+
 @app.route("/refresh")
 def refresh():
+    """Force a fresh build; show loading page until it's done."""
     with _cache["lock"]:
-        _cache["html"]      = build_dashboard()
-        _cache["timestamp"] = time.time()
+        _cache["html"]      = None   # invalidate cache
+        _cache["timestamp"] = 0
+        _cache["building"]  = False  # allow _trigger_build_if_needed to start one
+    _trigger_build_if_needed()
     return Response(
-        '<meta http-equiv="refresh" content="0; url=/">Refreshing...',
-        mimetype="text/html"
+        '<meta http-equiv="refresh" content="2; url=/">Refreshing…',
+        mimetype="text/html",
     )
+
 
 @app.route("/")
 def dashboard():
+    _trigger_build_if_needed()
+
     with _cache["lock"]:
-        age  = time.time() - _cache["timestamp"]
-        stale = _cache["html"] is None or age > CACHE_TTL
+        html = _cache["html"]
 
-    if stale:
-        with _cache["lock"]:
-            # Double-check after acquiring lock
-            age   = time.time() - _cache["timestamp"]
-            stale = _cache["html"] is None or age > CACHE_TTL
-            if stale:
-                _cache["html"]      = build_dashboard()
-                _cache["timestamp"] = time.time()
+    if html is None:
+        return Response(LOADING_PAGE, mimetype="text/html")
 
-    return Response(_cache["html"], mimetype="text/html")
+    return Response(html, mimetype="text/html")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ENTRY POINT
