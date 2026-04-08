@@ -122,13 +122,10 @@ def send_daily_report(rel_cols: dict):
         tickets = rel_cols.get(slug, [])
         count   = len(tickets)
         if count >= RELEASE_ALARM:
-            shown        = tickets[:5]
-            remaining    = count - len(shown)
             ticket_lines = "\n".join(
-                f"• <{JIRA_BASE_URL}/browse/{t['key']}|{t['key']}>" for t in shown
+                f"• <{JIRA_BASE_URL}/browse/{t['key']}|{t['key']}> — {t['fields'].get('summary','')[:60]}"
+                for t in tickets
             )
-            if remaining > 0:
-                ticket_lines += f"\n_…and {remaining} more_"
             alarm_blocks.append(
                 f":rotating_light: *{cfg['icon']} {cfg['label']}* — "
                 f"*{count} ticket{'s' if count != 1 else ''}* waiting for live release\n"
