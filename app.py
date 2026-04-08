@@ -106,21 +106,28 @@ p{font-size:13px;color:#666;line-height:1.5;margin-bottom:24px;}
 </body>
 </html>"""
 
-# Tracks which repos are currently in alarm state so we only fire Slack once
-# per transition (not on every refresh while alarm is active).
-_alarm_state: dict = {}   # slug -> bool
+# Tracks alarm state per repo.
+# Each entry: {"alarming": bool, "last_fired": float (unix timestamp)}
+# Slack fires only when alarm transitions False→True AND the last fire
+# was more than ALARM_COOLDOWN seconds ago (survives server restarts).
+ALARM_COOLDOWN = 4 * 3600   # re-notify at most once every 4 hours per repo
+_alarm_state: dict = {}     # slug -> {"alarming": bool, "last_fired": float}
 
 
 def send_slack_alarm(repo_label: str, icon: str, count: int, top_tickets: list):
-    """POST a message to Slack when a repo first trips the alarm threshold."""
+    """POST a message to Slack when a repo trips the alarm threshold."""
     if not SLACK_WEBHOOK_URL:
         return
-    ticket_list = "\n".join(f"• <{JIRA_BASE_URL}/browse/{t}|{t}>" for t in top_tickets[:5])
+    shown     = top_tickets[:5]
+    remaining = count - len(shown)
+    ticket_lines = "\n".join(f"• <{JIRA_BASE_URL}/browse/{t}|{t}>" for t in shown)
+    if remaining > 0:
+        ticket_lines += f"\n_…and {remaining} more_"
     payload = {
         "text": (
             f":rotating_light: *LTS Release Dashboard — {icon} {repo_label}* has "
-            f"*{count} tickets* waiting for live release and none have been deployed.\n"
-            f"{ticket_list}"
+            f"*{count} ticket{'s' if count != 1 else ''}* waiting for live release.\n"
+            f"{ticket_lines}"
         )
     }
     try:
@@ -130,17 +137,25 @@ def send_slack_alarm(repo_label: str, icon: str, count: int, top_tickets: list):
 
 
 def check_and_fire_alarms(rel_cols: dict):
-    """Compare current alarm states vs previous; fire Slack only on new alarms."""
+    """Fire Slack only when a repo transitions into alarm AND cooldown has elapsed."""
     global _alarm_state
+    now = time.time()
     for slug, cfg in REPO_MAP.items():
-        count        = len(rel_cols.get(slug, []))
-        is_alarming  = count >= RELEASE_ALARM
-        was_alarming = _alarm_state.get(slug, False)
-        if is_alarming and not was_alarming:
+        count       = len(rel_cols.get(slug, []))
+        is_alarming = count >= RELEASE_ALARM
+        state       = _alarm_state.get(slug, {"alarming": False, "last_fired": 0.0})
+        last_fired  = state["last_fired"]
+
+        # Fire if: currently alarming AND cooldown since last fire has elapsed
+        # (covers both fresh alarm transitions AND server-restart re-evaluations)
+        if is_alarming and (now - last_fired) > ALARM_COOLDOWN:
             top_keys = [t["key"] for t in rel_cols[slug][:5]]
             print(f"  🚨 Alarm fired for {cfg['label']} ({count} tickets) — notifying Slack")
             send_slack_alarm(cfg["label"], cfg["icon"], count, top_keys)
-        _alarm_state[slug] = is_alarming
+            _alarm_state[slug] = {"alarming": True, "last_fired": now}
+        else:
+            # Update alarming flag but preserve last_fired so cooldown is respected
+            _alarm_state[slug] = {"alarming": is_alarming, "last_fired": last_fired}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH
