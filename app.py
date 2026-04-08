@@ -107,19 +107,18 @@ p{font-size:13px;color:#666;line-height:1.5;margin-bottom:24px;}
 </html>"""
 
 # Tracks alarm state per repo.
-# Each entry: {"alarming": bool, "last_fired": float (unix timestamp)}
-# Slack fires only when alarm transitions False→True AND the last fire
-# was more than ALARM_COOLDOWN seconds ago (survives server restarts).
-ALARM_COOLDOWN = 4 * 3600   # re-notify at most once every 4 hours per repo
-_alarm_state: dict = {}     # slug -> {"alarming": bool, "last_fired": float}
+# None = first build not yet done (baseline not established).
+# On first build we record the state silently — no Slack fired.
+# Slack only fires on a genuine False→True transition in a live session.
+_alarm_state: dict = {}   # slug -> bool  (or absent if not yet seen)
 
 
 def send_slack_alarm(repo_label: str, icon: str, count: int, top_tickets: list):
     """POST a message to Slack when a repo trips the alarm threshold."""
     if not SLACK_WEBHOOK_URL:
         return
-    shown     = top_tickets[:5]
-    remaining = count - len(shown)
+    shown        = top_tickets[:5]
+    remaining    = count - len(shown)
     ticket_lines = "\n".join(f"• <{JIRA_BASE_URL}/browse/{t}|{t}>" for t in shown)
     if remaining > 0:
         ticket_lines += f"\n_…and {remaining} more_"
@@ -137,25 +136,32 @@ def send_slack_alarm(repo_label: str, icon: str, count: int, top_tickets: list):
 
 
 def check_and_fire_alarms(rel_cols: dict):
-    """Fire Slack only when a repo transitions into alarm AND cooldown has elapsed."""
+    """Fire Slack only on a genuine non-alarming → alarming transition.
+
+    On the very first build after a server start we silently record the
+    baseline state without firing — this prevents spurious notifications
+    every time Render's free tier wakes the instance back up.
+    """
     global _alarm_state
-    now = time.time()
     for slug, cfg in REPO_MAP.items():
         count       = len(rel_cols.get(slug, []))
         is_alarming = count >= RELEASE_ALARM
-        state       = _alarm_state.get(slug, {"alarming": False, "last_fired": 0.0})
-        last_fired  = state["last_fired"]
 
-        # Fire if: currently alarming AND cooldown since last fire has elapsed
-        # (covers both fresh alarm transitions AND server-restart re-evaluations)
-        if is_alarming and (now - last_fired) > ALARM_COOLDOWN:
+        if slug not in _alarm_state:
+            # First build — establish baseline silently, never fire here
+            print(f"  📋 Baseline for {cfg['label']}: {count} tickets "
+                  f"({'alarming' if is_alarming else 'ok'})")
+            _alarm_state[slug] = is_alarming
+            continue
+
+        was_alarming = _alarm_state[slug]
+        if is_alarming and not was_alarming:
+            # Genuine new alarm during this session — notify
             top_keys = [t["key"] for t in rel_cols[slug][:5]]
             print(f"  🚨 Alarm fired for {cfg['label']} ({count} tickets) — notifying Slack")
             send_slack_alarm(cfg["label"], cfg["icon"], count, top_keys)
-            _alarm_state[slug] = {"alarming": True, "last_fired": now}
-        else:
-            # Update alarming flag but preserve last_fired so cooldown is respected
-            _alarm_state[slug] = {"alarming": is_alarming, "last_fired": last_fired}
+
+        _alarm_state[slug] = is_alarming
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH
