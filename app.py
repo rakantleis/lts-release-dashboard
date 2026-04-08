@@ -53,7 +53,8 @@ REPO_MAP = {
 
 IGNORE_REPOS = set()
 
-CACHE_TTL = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # default 15 minutes
+CACHE_TTL         = int(os.getenv("CACHE_TTL_SECONDS", "900"))  # default 15 minutes
+SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")          # optional Slack alarm
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FLASK APP
@@ -67,6 +68,42 @@ _cache = {
     "lock":      threading.Lock(),
     "building":  False,
 }
+
+# Tracks which repos are currently in alarm state so we only fire Slack once
+# per transition (not on every refresh while alarm is active).
+_alarm_state: dict = {}   # slug -> bool
+
+
+def send_slack_alarm(repo_label: str, icon: str, count: int, top_tickets: list):
+    """POST a message to Slack when a repo first trips the alarm threshold."""
+    if not SLACK_WEBHOOK_URL:
+        return
+    ticket_list = "\n".join(f"• <{JIRA_BASE_URL}/browse/{t}|{t}>" for t in top_tickets[:5])
+    payload = {
+        "text": (
+            f":rotating_light: *LTS Release Dashboard — {icon} {repo_label}* has "
+            f"*{count} tickets* waiting for live release and none have been deployed.\n"
+            f"{ticket_list}"
+        )
+    }
+    try:
+        http_requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=5)
+    except Exception as e:
+        print(f"  ⚠  Slack notification failed: {e}")
+
+
+def check_and_fire_alarms(rel_cols: dict):
+    """Compare current alarm states vs previous; fire Slack only on new alarms."""
+    global _alarm_state
+    for slug, cfg in REPO_MAP.items():
+        count        = len(rel_cols.get(slug, []))
+        is_alarming  = count >= RELEASE_ALARM
+        was_alarming = _alarm_state.get(slug, False)
+        if is_alarming and not was_alarming:
+            top_keys = [t["key"] for t in rel_cols[slug][:5]]
+            print(f"  🚨 Alarm fired for {cfg['label']} ({count} tickets) — notifying Slack")
+            send_slack_alarm(cfg["label"], cfg["icon"], count, top_keys)
+        _alarm_state[slug] = is_alarming
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AUTH
@@ -375,6 +412,8 @@ def build_dashboard() -> str:
 
     rel_cols, rel_undetected, rel_unknown = organise_by_repo(release_issues, ticket_repos)
     blk_cols, _,              blk_unknown = organise_by_repo(blocker_issues, ticket_repos)
+
+    check_and_fire_alarms(rel_cols)
 
     # KPI strip
     kpi_html = ""
