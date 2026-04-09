@@ -586,27 +586,25 @@ def cron_daily_report():
     if CRON_SECRET and flask_request.args.get("secret") != CRON_SECRET:
         return "Forbidden", 403
 
-    # Use cached data if fresh, otherwise build now (blocks — cron callers can wait)
-    with _cache["lock"]:
-        age   = time.time() - _cache["timestamp"]
-        stale = _cache["html"] is None or age > CACHE_TTL
-
-    if stale:
-        print("[cron] Cache stale — building fresh data for daily report...")
-        html = build_dashboard()
-        with _cache["lock"]:
-            _cache["html"]      = html
-            _cache["timestamp"] = time.time()
-
-    # Re-run organise step to get rel_cols from the latest Jira data
-    print("[cron] Running daily report check...")
-    release_issues = get_release_tickets()
-    blocker_issues = get_blocker_tickets()
-    all_issues     = release_issues + blocker_issues
-    ticket_repos   = fetch_all_repos(all_issues)
-    rel_cols, _, _ = organise_by_repo(release_issues, ticket_repos)
-    send_daily_report(rel_cols)
+    # Return 200 immediately so cron-job.org doesn't time out waiting.
+    # The actual report runs in a background thread.
+    t = threading.Thread(target=_run_daily_report, daemon=True)
+    t.start()
     return "OK", 200
+
+
+def _run_daily_report():
+    """Fetch fresh data and send Slack report. Always runs in a background thread."""
+    try:
+        print("[cron] Running daily report...")
+        release_issues = get_release_tickets()
+        blocker_issues = get_blocker_tickets()
+        all_issues     = release_issues + blocker_issues
+        ticket_repos   = fetch_all_repos(all_issues)
+        rel_cols, _, _ = organise_by_repo(release_issues, ticket_repos)
+        send_daily_report(rel_cols)
+    except Exception as e:
+        print(f"  ❌ Daily report failed: {e}")
 
 def _background_build():
     """Run build_dashboard() in a background thread; store result in cache."""
